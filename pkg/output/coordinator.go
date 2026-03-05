@@ -7,23 +7,27 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
+
+	"github.com/projectdiscovery/gologger"
 )
 
 // AsyncOutputCoordinator manages async writing of scan results to disk.
-// It uses a buffered channel for concurrent submission and a dedicated goroutine for writing.
-// No mutexes are used; coordination is done via channels (Go-style).
+// Uses buffered channel for concurrent submission and periodic flushing.
 type AsyncOutputCoordinator struct {
 	outputChan  chan []byte
 	file        *os.File
 	writer      *bufio.Writer
-	done        chan struct{}
 	shutdownCtx context.Context
 	cancel      context.CancelFunc
+	flushTicker *time.Ticker
+	done        chan struct{}
 }
 
 // NewAsyncOutputCoordinator creates a new coordinator.
 // bufferSize: Size of the buffered channel (e.g., 10000 for 10k pending results).
-func NewAsyncOutputCoordinator(filename string, bufferSize int) (*AsyncOutputCoordinator, error) {
+// flushInterval: How often to flush the buffer to disk (e.g., 1*time.Second).
+func NewAsyncOutputCoordinator(filename string, bufferSize int, flushInterval time.Duration) (*AsyncOutputCoordinator, error) {
 	file, err := os.Create(filename)
 	if err != nil {
 		return nil, err
@@ -34,48 +38,63 @@ func NewAsyncOutputCoordinator(filename string, bufferSize int) (*AsyncOutputCoo
 		outputChan:  make(chan []byte, bufferSize),
 		file:        file,
 		writer:      bufio.NewWriter(file),
-		done:        make(chan struct{}),
 		shutdownCtx: ctx,
 		cancel:      cancel,
+		flushTicker:  time.NewTicker(flushInterval),
+		done:        make(chan struct{}),
 	}
 
-	// Start the writer goroutine
 	go coord.writeLoop()
 	return coord, nil
 }
 
 // writeLoop is the dedicated goroutine for writing to disk.
-// It flushes after every write to prevent truncated output.
+// Uses periodic flushing instead of flushing after every write.
 func (c *AsyncOutputCoordinator) writeLoop() {
-	defer close(c.done)
+	defer func() {
+		c.flushTicker.Stop()
+		close(c.done)
+	}()
+
 	for {
 		select {
 		case data, ok := <-c.outputChan:
 			if !ok {
-				// Channel closed, flush and exit
-				c.writer.Flush()
+				// Channel closed, drain remaining data
+				if err := c.writer.Flush(); err != nil {
+					gologger.Warning().Msgf("Failed to flush writer during shutdown: %v", err)
+				}
 				return
 			}
 			if _, err := c.writer.Write(data); err != nil {
+				gologger.Warning().Msgf("Failed to write data: %v", err)
 				continue
 			}
+
+		case <-c.flushTicker.C:
 			if err := c.writer.Flush(); err != nil {
-				continue
+				gologger.Warning().Msgf("Failed to flush writer: %v", err)
 			}
+
 		case <-c.shutdownCtx.Done():
-			// Flush remaining data on shutdown
+			// Drain the channel before exiting
 			for {
 				select {
 				case data, ok := <-c.outputChan:
 					if !ok {
-						c.writer.Flush()
+						if err := c.writer.Flush(); err != nil {
+							gologger.Warning().Msgf("Failed to flush writer during shutdown: %v", err)
+						}
 						return
 					}
 					if _, err := c.writer.Write(data); err != nil {
+						gologger.Warning().Msgf("Failed to write data during shutdown: %v", err)
 						continue
 					}
 				default:
-					c.writer.Flush()
+					if err := c.writer.Flush(); err != nil {
+						gologger.Warning().Msgf("Failed to flush writer during shutdown: %v", err)
+					}
 					return
 				}
 			}
@@ -91,6 +110,7 @@ func (c *AsyncOutputCoordinator) Submit(result interface{}) error {
 		return err
 	}
 	data = append(data, '\n')
+
 	select {
 	case c.outputChan <- data:
 		return nil
@@ -108,12 +128,13 @@ func (c *AsyncOutputCoordinator) GracefulShutdown() error {
 }
 
 // HandleSignals sets up signal handling for graceful shutdown on CTRL+C.
+// Does not call os.Exit(), allowing defer statements to execute.
 func (c *AsyncOutputCoordinator) HandleSignals() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
+		gologger.Info().Msg("Received interrupt signal. Shutting down gracefully...")
 		c.GracefulShutdown()
-		os.Exit(0)
 	}()
 }
