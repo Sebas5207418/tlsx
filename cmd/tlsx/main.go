@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"strings"
+	"time"
 
 	"github.com/projectdiscovery/goflags"
 	"github.com/projectdiscovery/gologger"
@@ -31,16 +32,21 @@ func process() error {
 		return errkit.Wrapf(err, "could not read flags")
 	}
 
-	// Inizializza il coordinatore se è specificato un file di output
+	// Initialize output coordinator if output file is specified
 	var coord *output.AsyncOutputCoordinator
 	var err error
 	if options.OutputFile != "" {
-		coord, err = output.NewAsyncOutputCoordinator(options.OutputFile, 10000)
+		coord, err = output.NewAsyncOutputCoordinator(options.OutputFile, 10000, 1*time.Second)
 		if err != nil {
 			return errkit.Wrapf(err, "could not initialize output coordinator")
 		}
-		defer coord.GracefulShutdown()
+		options.AsyncOutputCoordinator = coord
 		coord.HandleSignals()
+		defer func() {
+			if err := coord.GracefulShutdown(); err != nil {
+				gologger.Warning().Msgf("Error during graceful shutdown: %v", err)
+			}
+		}()
 	}
 
 	runner, err := runner.New(options)
@@ -126,7 +132,7 @@ func readFlags(args ...string) error {
 		flagSet.StringSliceVarP(&options.Resolvers, "resolvers", "r", nil, "list of resolvers to use", goflags.FileCommaSeparatedStringSliceOptions),
 		flagSet.StringVarP(&options.CACertificate, "cacert", "cc", "", "client certificate authority file"),
 		flagSet.StringSliceVarP(&options.Ciphers, "cipher-input", "ci", nil, "ciphers to use with tls connection", goflags.FileCommaSeparatedStringSliceOptions),
-		flagSet.StringSliceVar(&options.ServerName, "sni", nil, "tls sni hostname to use", goflags.FileCommaSeparatedStringSliceOptions),
+		flagSet.StringSliceVar(&options.ServerName, "sni", nil, "tls sni hostname to use", goflags.NormalizedStringSliceOptions),
 		flagSet.BoolVarP(&options.RandomForEmptyServerName, "random-sni", "rs", false, "use random sni when empty"),
 		flagSet.BoolVarP(&options.ReversePtrSNI, "rev-ptr-sni", "rps", false, "perform reverse PTR to retrieve SNI from IP"),
 		flagSet.StringVar(&options.MinVersion, "min-version", "", "minimum tls version to accept (ssl30,tls10,tls11,tls12,tls13)"),
