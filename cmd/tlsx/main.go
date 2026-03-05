@@ -7,6 +7,7 @@ import (
 	"github.com/projectdiscovery/goflags"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/tlsx/internal/runner"
+	"github.com/projectdiscovery/tlsx/pkg/output"
 	"github.com/projectdiscovery/tlsx/pkg/tlsx/clients"
 	"github.com/projectdiscovery/tlsx/pkg/tlsx/openssl"
 	"github.com/projectdiscovery/utils/errkit"
@@ -29,6 +30,19 @@ func process() error {
 	if err := readFlags(); err != nil {
 		return errkit.Wrapf(err, "could not read flags")
 	}
+
+	// Inizializza il coordinatore se è specificato un file di output
+	var coord *output.AsyncOutputCoordinator
+	var err error
+	if options.OutputFile != "" {
+		coord, err = output.NewAsyncOutputCoordinator(options.OutputFile, 10000)
+		if err != nil {
+			return errkit.Wrapf(err, "could not initialize output coordinator")
+		}
+		defer coord.GracefulShutdown()
+		coord.HandleSignals()
+	}
+
 	runner, err := runner.New(options)
 	if err != nil {
 		return errkit.Wrapf(err, "could not create runner")
